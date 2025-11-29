@@ -1,0 +1,234 @@
+---
+title: "NYPD SHOOTING REPORT FINAL EDIT"
+author: "LS"
+date: "2025-11-29"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+### Loading in the data
+
+```{r setup, echo = TRUE}
+library(tidyverse)
+library(lubridate)
+
+NYPD_shooting_data = read.csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+
+NYPD = NYPD_shooting_data %>%
+  select(c(OCCUR_DATE, OCCUR_TIME, BORO, STATISTICAL_MURDER_FLAG,
+            PERP_AGE_GROUP, PERP_SEX, PERP_RACE,
+            VIC_AGE_GROUP, VIC_SEX, VIC_RACE)) %>%
+  mutate(OCCUR_TIME = hms(OCCUR_TIME)) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+  mutate(PERP_SEX = ifelse(!PERP_SEX %in% c("M", "F"), "UNKNOWN", PERP_SEX)) %>%
+  mutate(PERP_RACE = ifelse(PERP_RACE %in% c("", NULL, "(null)", NA, "U"), "UNKNOWN", PERP_RACE)) %>%
+  mutate(PERP_AGE_GROUP = ifelse(PERP_AGE_GROUP %in% c("", NULL, "(null)", NA, "U"), "UNKNOWN", 
+                                 PERP_AGE_GROUP)) %>%
+  mutate(STATISTICAL_MURDER_FLAG = as.logical(STATISTICAL_MURDER_FLAG)) %>%
+  mutate(hours = (period_to_seconds(OCCUR_TIME))/(60*60))
+```
+
+### Data Summary
+
+To handle missing data I searched for all the relevant places data was missing 
+
+For instance -
+
+`mutate(PERP_RACE = ifelse(PERP_RACE %in% c("", NULL, "(null)", NA, "U"), "UNKNOWN", PERP_RACE))` 
+
+
+This replaces all instances of "", NULL, "(null)", NA, or "U" with "UNKNOWN in the PERP_RACE column.
+
+All shootings have a time and date. None of my analysis relies on other categories such as race or location.
+
+```{r summary, echo = TRUE}
+summary(NYPD)
+```
+
+
+### Visualization 1
+```{r visual 1 data, echo=TRUE}
+PERP_KNOWN = NYPD %>%
+  filter(PERP_SEX != "UNKNOWN") %>%
+  count(VIC_SEX) %>%
+  mutate(percent = n/sum(n)) %>%
+  mutate(PERP_SEX = "Known")
+ 
+PERP_UNKNOWN = NYPD %>%
+  filter(PERP_SEX == "UNKNOWN") %>%
+  count(VIC_SEX) %>%
+  mutate(percent = n/sum(n)) %>%
+  mutate(PERP_SEX = "Unknown")
+
+Vis1_data = bind_rows(PERP_KNOWN, PERP_UNKNOWN)
+```
+
+```{r visual 1, echo = TRUE}
+Vis1_data %>%
+  ggplot(aes(x = PERP_SEX, y = percent, fill = VIC_SEX)) +
+  geom_col() +
+  theme_classic() +
+  scale_fill_manual(values = c("M" = "#cfc034", "F" = "#7a1871")) +
+  labs(title = "PERP_SEX vs VIC_SEX as percent")
+
+``` 
+
+This visualization is comparing the victim's sex depending on if the shooters sex is known. This is making an assumption that unknown shooter sex means the shooter was not caught. I am trying to show if these types of crimes are possibly statistically different. Looking at this data the difference is around 4%, with unknown shooters shooting males more often. From this it is hard to make a robust conclusion. This does not really raise any questions.
+
+### Visualization 2
+```{r visual 2 data, echo=TRUE}
+NYPD_AM = NYPD %>%
+  mutate(hour_binned = hours + 1) %>%
+  filter(hour_binned >= 10)
+NYPD_PM = NYPD %>%
+  mutate(hour_binned = hours + 1) %>%
+  filter(hour_binned < 10)%>%
+  mutate(hour_binned = hour_binned + 24)
+
+NYPD_TIME_SHIFT = full_join(NYPD_AM, NYPD_PM)
+```
+
+```{r visual 2, echo = TRUE}
+NYPD_TIME_SHIFT = NYPD_TIME_SHIFT%>%
+  mutate(Shooter_Found = ifelse(PERP_SEX %in% c("M", "F"), "Found", PERP_SEX))
+
+NYPD_TIME_SHIFT %>%
+  ggplot(aes(x = hour_binned, color = Shooter_Found, y = after_stat(density))) +
+  geom_histogram(breaks = seq(10,34,1),
+                 alpha = .5,
+                 position = "identity") +
+  labs(title = "Shooting density when the shooter is found and not found",
+       x = "Hour",
+       y = "Density")+
+  theme_light()
+```
+
+I wondered if the shooters are less likely to be caught if the crime happens at night. From this visualization it appears this is possible but not a very strong relationship. I think it does suggest something about how time of day is related to this data. I notice that the data appears to follow a normal distribution.
+
+### Visualization 3
+
+```{r visual 3 data, echo=TRUE}
+NYPD_SHIFTED_PER_HOUR = NYPD_TIME_SHIFT %>%
+  mutate(hour_binned = as.integer(hour_binned)) %>%
+  count(hour_binned)
+```
+
+```{r visual 3, echo=TRUE}
+hist(NYPD_TIME_SHIFT$hour_binned, prob = TRUE,
+     breaks = seq(10,34,1),
+     main = "Histogram of Shooting Density per Hour",
+     xlab = "Hour")
+curve(dnorm(x, mean = mean(NYPD_TIME_SHIFT$hour_binned),
+            sd = sd(NYPD_TIME_SHIFT$hour_binned)),
+        add = TRUE)
+
+qqnorm(NYPD_SHIFTED_PER_HOUR$n)
+qqline(NYPD_SHIFTED_PER_HOUR$n)
+
+shapiro.test(NYPD_SHIFTED_PER_HOUR$n)
+```
+
+To answer this question I have made a histogram of the times shootings occur. From this data it appears shootings peak from 12AM - 1AM. I wonder if time can be used to predict number of shootings. I used a Shapiro-Wilk normality test and analyzed a q-q plot to determine if the data follows a true normal distribution.
+
+### Model
+
+```{r model, echo=TRUE}
+
+NYPD_mod = nls(n ~ h * exp((-((hour_binned - mu)^2)) / (2 * (sigma^2))), 
+               data = NYPD_SHIFTED_PER_HOUR,
+               start = list(h = 2465, sigma = 2, mu = 20))
+
+summary(NYPD_mod)
+NYPD_SHIFTED_PER_HOUR_W_PRED = NYPD_SHIFTED_PER_HOUR %>%
+  mutate(pred = predict(NYPD_mod)) 
+
+chi_table = table(NYPD_SHIFTED_PER_HOUR_W_PRED$n,
+                  NYPD_SHIFTED_PER_HOUR_W_PRED$pred)
+chisq.test(chi_table)
+```
+
+```{r plot model, echo=TRUE}
+NYPD_SHIFTED_PER_HOUR_W_PRED %>%
+  
+  ggplot() +
+  geom_point(aes(x = hour_binned, y = n), color = "blue") +
+  geom_line(aes(x = hour_binned, y = pred), color = "red") +
+  geom_point(aes(x = hour_binned, y = pred), color = "red") +
+  labs(title = "Shooing Data Overlayed with Normal Model (in RED)",
+       y = "Number of shootings", x = "Time of Day",
+       color = "y") +
+  scale_x_continuous(breaks = seq(10,33, 2),
+                     labels = c("10AM", "12PM", "2PM", "4PM",
+                                "6PM", "8PM", "10PM", "12AM",
+                                "2AM", "4AM", "6AM", "8AM")) +
+
+  theme_light() +
+  theme(legend.position = "bottom") 
+  
+```
+
+This model seems to fit relatively well. A point at 10AM means that 254 shootings occurred between 10AM and 11AM.
+
+### Model 2, different perspective 
+
+```{r take 2, echo=TRUE}
+NYPD_PER_HOUR = NYPD %>%
+mutate(hours = cut(hours, breaks = seq(0,24,1))) %>%
+  count(hours) %>%
+  mutate(hours = as.integer(hours)) %>%
+  drop_na()
+
+```
+
+```{r mod 3, echo=TRUE}
+NYPD_mod3 = lm(n ~ poly(hours, 2), data = NYPD_PER_HOUR)
+summary(NYPD_mod3)
+NYPD_PER_HOUR_W_PRED = NYPD_PER_HOUR %>%
+  mutate(pred = predict(NYPD_mod3)) 
+
+NYPD_PER_HOUR_W_PRED %>%
+  
+  ggplot() +
+  geom_point(aes(x = hours, y = n), color = "blue") +
+  geom_line(aes(x = hours, y = pred), color = "red") +
+  geom_point(aes(x = hours, y = pred), color = "red") 
+```
+
+### Visual 4,5,6 for fun
+
+```{r test visual, echo=TRUE}
+nypd_test = NYPD %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  mutate(YEAR = as.character(YEAR)) %>%
+  mutate(plot_date = make_date(2000, month(OCCUR_DATE),
+                                   day(OCCUR_DATE)))
+
+ggplot(data = nypd_test) +
+  geom_histogram(aes(x = plot_date, color = YEAR), bins = 12) +
+  scale_x_date(date_labels = "%m-%d")
+
+ggplot(data = nypd_test) +
+  geom_histogram(aes(x = plot_date, color = YEAR), bins = 365) +
+  scale_x_date(date_labels = "%m-%d")
+
+nypd_test %>%
+  mutate(YEAR = as.numeric(YEAR)) %>%
+  ggplot(aes(x = YEAR)) +
+  geom_histogram(bins = (2024 - 2006))
+
+```
+
+After all that I wanted to check if the month of year had anything to do with shooting density, turns out it certainly does. What about the day of year? The year itself? These tell me about some of the biases included in my model.
+
+### Bias
+The bias associated with this data could come from many different sources. The city (NY) and the police associated with the city could have bias included in the reporting and response to the shootings. The source of the digital data could be imparting bias to the data in how they report the categories. The way the data is interpreted could add bias, data dealing with sex, race, and age specifically. My analysis definitely added bias to my initial report, I interpreted some of the data in the wrong way. This has been corrected in this final version. For my analysis I tried to stay away from these issues and went with reporting on shooting count and time.
+  Other bias is introduced by my lack of knowledge in this area, possibly not all of these shootings are person on person violence. I might have been making assumptions when I filled in unknown when data about a perp was blank.
+
+## Conclusion
+In conclusion I was able to use time of day to model the distribution of shooting occurrences. Shootings appear to peak from 12AM - 1AM. I think this model is relatively bias free besides any bias that would be included in the provided data. However, it will over predict shootings in months with a below average number of shootings and under predict in months with above average.
+
+
+```{r info, echo=TRUE}
+sessionInfo()
+```
